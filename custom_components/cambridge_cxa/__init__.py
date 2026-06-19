@@ -13,7 +13,7 @@ from .coordinator import CambridgeCXACoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["media_player", "switch", "select", "button"]
+PLATFORMS = ["media_player"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

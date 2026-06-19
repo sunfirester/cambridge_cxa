@@ -26,14 +26,10 @@ from .const import (
     AMP_CMD_SET_MUTE_ON,
     AMP_CMD_SET_PWR_OFF,
     AMP_CMD_SET_PWR_ON,
-    AMP_CMD_VOL_DOWN,
-    AMP_CMD_VOL_UP,
     AMP_REPLY_MUTE_ON,
     AMP_REPLY_PWR_ON,
-    AMP_REPLY_VOLUME_PREFIX,
     DEFAULT_NAME,
     DOMAIN,
-    MAX_VOLUME,
     NORMAL_INPUTS_AMP_REPLY_CXA61,
     NORMAL_INPUTS_AMP_REPLY_CXA81,
     NORMAL_INPUTS_CXA61,
@@ -50,8 +46,6 @@ SUPPORT_CXA = (
     | MediaPlayerEntityFeature.TURN_OFF
     | MediaPlayerEntityFeature.TURN_ON
     | MediaPlayerEntityFeature.VOLUME_MUTE
-    | MediaPlayerEntityFeature.VOLUME_STEP
-    | MediaPlayerEntityFeature.VOLUME_SET
 )
 
 
@@ -141,19 +135,7 @@ class CambridgeCXADevice(
             return None
         return AMP_REPLY_MUTE_ON in self.coordinator.data.get("mute", "")
 
-    @property
-    def volume_level(self) -> float | None:
-        """Return volume as 0.0–1.0 (mapped from 0–96)."""
-        if self.coordinator.data is None:
-            return None
-        reply = self.coordinator.data.get("volume", "")
-        if reply.startswith(AMP_REPLY_VOLUME_PREFIX):
-            try:
-                raw = int(reply[len(AMP_REPLY_VOLUME_PREFIX):])
-                return raw / MAX_VOLUME
-            except ValueError:
-                pass
-        return None
+
 
     @property
     def source(self) -> str | None:
@@ -193,21 +175,7 @@ class CambridgeCXADevice(
         await self.coordinator.async_command(cmd)
         await self.coordinator.async_request_refresh()
 
-    async def async_volume_up(self) -> None:
-        """Send a volume-up step via RS232 (#01,16)."""
-        await self.coordinator.async_command(AMP_CMD_VOL_UP)
-        await self.coordinator.async_request_refresh()
 
-    async def async_volume_down(self) -> None:
-        """Send a volume-down step via RS232 (#01,17)."""
-        await self.coordinator.async_command(AMP_CMD_VOL_DOWN)
-        await self.coordinator.async_request_refresh()
-
-    async def async_set_volume_level(self, volume: float) -> None:
-        """Set absolute volume level (0.0–1.0 → 0–96 via #01,14,n)."""
-        level = round(volume * MAX_VOLUME)
-        await self.coordinator.async_command(f"#01,14,{level}")
-        await self.coordinator.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:
         cmd = self._source_list.get(source)

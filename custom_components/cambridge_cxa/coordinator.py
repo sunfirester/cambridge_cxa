@@ -9,13 +9,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
-    AMP_CMD_GET_BRIGHTNESS,
     AMP_CMD_GET_CURRENT_SOURCE,
     AMP_CMD_GET_MUTE_STATE,
-    AMP_CMD_GET_PHASE,
-    AMP_CMD_GET_PREAMP,
     AMP_CMD_GET_PWSTATE,
-    AMP_CMD_GET_VOLUME,
     AMP_REPLY_PWR_ON,
     DOMAIN,
 )
@@ -74,15 +70,31 @@ class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
             await self._close_connection()
 
     async def async_command(self, command: str) -> None:
-        """Send a command that does not require a reply (e.g. power on, volume step)."""
+        """Send a command with no reply expected (e.g. power on, volume step).
+
+        After sending, we attempt to drain any reply the amp may have sent
+        (e.g. a volume echo) with a short timeout.  Without this, stale reply
+        bytes sit in the TCP buffer and corrupt the next readuntil() call in
+        the polling cycle, making the integration think the amp switched off.
+        """
         async with self._command_lock:
             await self._ensure_connected()
             if not self._is_connected():
                 _LOGGER.warning("Cannot send '%s': not connected", command)
                 return
             try:
+                _LOGGER.debug("TX: %s", command)
                 self._writer.write((command + "\r").encode("utf-8"))  # type: ignore[union-attr]
                 await self._writer.drain()  # type: ignore[union-attr]
+                # Consume any unsolicited reply within 300 ms.
+                try:
+                    reply = await asyncio.wait_for(
+                        self._reader.readuntil(b"\r"),  # type: ignore[union-attr]
+                        timeout=0.3,
+                    )
+                    _LOGGER.debug("RX (unsolicited after %s): %s", command, reply.decode("utf-8").strip())
+                except (asyncio.TimeoutError, asyncio.LimitOverrunError):
+                    pass  # No reply — expected for many commands
             except OSError as err:
                 _LOGGER.warning("Send failed for '%s': %s", command, err)
                 await self._close_connection()
@@ -116,10 +128,6 @@ class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
             if AMP_REPLY_PWR_ON in power:
                 data["source"] = await self._send_with_reply(AMP_CMD_GET_CURRENT_SOURCE)
                 data["mute"] = await self._send_with_reply(AMP_CMD_GET_MUTE_STATE)
-                data["volume"] = await self._send_with_reply(AMP_CMD_GET_VOLUME)
-                data["preamp"] = await self._send_with_reply(AMP_CMD_GET_PREAMP)
-                data["brightness"] = await self._send_with_reply(AMP_CMD_GET_BRIGHTNESS)
-                data["phase"] = await self._send_with_reply(AMP_CMD_GET_PHASE)
 
             return data
 
@@ -176,6 +184,7 @@ class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
         if not self._is_connected():
             return ""
         try:
+            _LOGGER.debug("TX: %s", command)
             self._writer.write((command + "\r").encode("utf-8"))  # type: ignore[union-attr]
             await self._writer.drain()  # type: ignore[union-attr]
             # The CXA protocol uses \r (CR) as line terminator, not \n.
@@ -184,7 +193,9 @@ class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
                 self._reader.readuntil(b"\r"),  # type: ignore[union-attr]
                 timeout=2.0,
             )
-            return reply.decode("utf-8").strip()
+            decoded = reply.decode("utf-8").strip()
+            _LOGGER.debug("RX: %s", decoded)
+            return decoded
         except (OSError, asyncio.TimeoutError, UnicodeDecodeError, asyncio.LimitOverrunError) as err:
             _LOGGER.warning("Command '%s' failed: %s", command, err)
             await self._close_connection()
