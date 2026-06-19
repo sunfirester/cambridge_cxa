@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Cambridge Audio CXA",
+        "description": "Connect to your Cambridge Audio CXA amplifier via ser2net running on a Raspberry Pi (or any network-accessible serial bridge).",
+        "data": {
+          "host": "Host / IP Address",
+          "port": "Port",
+          "cxa_type": "Amplifier Model",
+          "name": "Name"
+        },
+        "data_description": {
+          "host": "IP address or hostname of the device running ser2net",
+          "port": "TCP port configured in ser2net (default: 5000)",
+          "cxa_type": "Select your exact amplifier model",
+          "name": "Friendly name shown in Home Assistant"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to ser2net at the given host and port. Make sure ser2net is running and reachable."
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  }
+}

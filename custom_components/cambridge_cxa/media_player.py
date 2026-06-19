@@ -1,277 +1,224 @@
 """
-Support for controlling a Cambridge Audio CXA amplifier over a serial connection.
+Cambridge Audio CXA media player entity.
 
-For more details about this platform, please refer to the documentation at
-https://github.com/lievencoghe/cambridge_audio_cxa
+Communicates with the amplifier over a TCP connection to a ser2net bridge
+running on a Raspberry Pi (or any RS232-over-TCP adapter).  All I/O is
+async; state is driven by the shared CambridgeCXACoordinator.
 """
+from __future__ import annotations
 
 import logging
-import urllib.request
-import voluptuous as vol
-from serial import Serial
 
 from homeassistant.components.media_player import (
-    PLATFORM_SCHEMA,
     MediaPlayerEntity,
-    MediaPlayerEntityFeature
+    MediaPlayerEntityFeature,
+    MediaPlayerState,
 )
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from homeassistant.const import (
-    CONF_DEVICE,
-    CONF_NAME,
-    CONF_SLAVE,
-    CONF_TYPE,
-    STATE_OFF,
-    STATE_ON,
+from .const import (
+    AMP_CMD_SET_MUTE_OFF,
+    AMP_CMD_SET_MUTE_ON,
+    AMP_CMD_SET_PWR_OFF,
+    AMP_CMD_SET_PWR_ON,
+    AMP_CMD_VOL_DOWN,
+    AMP_CMD_VOL_UP,
+    AMP_REPLY_MUTE_ON,
+    AMP_REPLY_PWR_ON,
+    AMP_REPLY_VOLUME_PREFIX,
+    DEFAULT_NAME,
+    DOMAIN,
+    MAX_VOLUME,
+    NORMAL_INPUTS_AMP_REPLY_CXA61,
+    NORMAL_INPUTS_AMP_REPLY_CXA81,
+    NORMAL_INPUTS_CXA61,
+    NORMAL_INPUTS_CXA81,
+    SOUND_MODES,
 )
-
-import homeassistant.helpers.config_validation as cv
-
-import homeassistant.loader as loader
-
-__version__ = "0.5"
+from .coordinator import CambridgeCXACoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-
-"""
 SUPPORT_CXA = (
-    SUPPORT_SELECT_SOURCE
-    | SUPPORT_SELECT_SOUND_MODE
-    | SUPPORT_TURN_OFF
-    | SUPPORT_TURN_ON
-    | SUPPORT_VOLUME_MUTE
-)
-
-SUPPORT_CXA_WITH_CXN = (
-    SUPPORT_SELECT_SOURCE
-    | SUPPORT_SELECT_SOUND_MODE
-    | SUPPORT_TURN_OFF
-    | SUPPORT_TURN_ON
-    | SUPPORT_VOLUME_MUTE
-    | SUPPORT_VOLUME_STEP
-)
-"""
-
-SUPPORT_CXA = (
-    MediaPlayerEntityFeature.SELECT_SOURCE
-    | MediaPlayerEntityFeature.SELECT_SOUND_MODE
-    | MediaPlayerEntityFeature.TURN_OFF
-    | MediaPlayerEntityFeature.TURN_ON
-    | MediaPlayerEntityFeature.VOLUME_MUTE
-)
-
-SUPPORT_CXA_WITH_CXN = (
     MediaPlayerEntityFeature.SELECT_SOURCE
     | MediaPlayerEntityFeature.SELECT_SOUND_MODE
     | MediaPlayerEntityFeature.TURN_OFF
     | MediaPlayerEntityFeature.TURN_ON
     | MediaPlayerEntityFeature.VOLUME_MUTE
     | MediaPlayerEntityFeature.VOLUME_STEP
+    | MediaPlayerEntityFeature.VOLUME_SET
 )
 
-DEFAULT_NAME = "Cambridge Audio CXA"
-DEVICE_CLASS = "receiver"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_DEVICE): cv.string,
-        vol.Required(CONF_TYPE): cv.string,      
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_SLAVE): cv.string,
-    }
-)
-
-NORMAL_INPUTS_CXA61 = {
-    "A1" : "#03,04,00",
-    "A2" : "#03,04,01",
-    "A3" : "#03,04,02",
-    "A4" : "#03,04,03",
-    "D1" : "#03,04,04",
-    "D2" : "#03,04,05",
-    "D3" : "#03,04,06",
-    "Bluetooth" : "#03,04,14",
-    "USB" : "#03,04,16",
-    "MP3" : "#03,04,10"
-}
-
-NORMAL_INPUTS_CXA81 = {
-    "A1" : "#03,04,00",
-    "A2" : "#03,04,01",
-    "A3" : "#03,04,02",
-    "A4" : "#03,04,03",
-    "D1" : "#03,04,04",
-    "D2" : "#03,04,05",
-    "D3" : "#03,04,06",
-    "Bluetooth" : "#03,04,14",
-    "USB" : "#03,04,16",
-    "XLR" : "#03,04,20"
-}
-
-NORMAL_INPUTS_AMP_REPLY_CXA61 = {
-    "#04,01,00" : "A1",
-    "#04,01,01" : "A2",
-    "#04,01,02" : "A3",
-    "#04,01,03" : "A4",
-    "#04,01,04" : "D1",
-    "#04,01,05" : "D2",
-    "#04,01,06" : "D3",
-    "#04,01,14" : "Bluetooth",
-    "#04,01,16" : "USB",
-    "#04,01,10" : "MP3"
-}
-
-NORMAL_INPUTS_AMP_REPLY_CXA81 = {
-    "#04,01,00" : "A1",
-    "#04,01,01" : "A2",
-    "#04,01,02" : "A3",
-    "#04,01,03" : "A4",
-    "#04,01,04" : "D1",
-    "#04,01,05" : "D2",
-    "#04,01,06" : "D3",
-    "#04,01,14" : "Bluetooth",
-    "#04,01,16" : "USB",
-    "#04,01,20" : "XLR"
-}
-
-SOUND_MODES = {
-    "A" : "#1,25,0",
-    "AB" : "#1,25,1",
-    "B" : "#1,25,2"
-}
-
-AMP_CMD_GET_PWSTATE = "#01,01"
-AMP_CMD_GET_CURRENT_SOURCE = "#03,01"
-AMP_CMD_GET_MUTE_STATE = "#01,03"
-
-AMP_CMD_SET_MUTE_ON = "#01,04,1"
-AMP_CMD_SET_MUTE_OFF = "#01,04,0"
-AMP_CMD_SET_PWR_ON = "#01,02,1"
-AMP_CMD_SET_PWR_OFF = "#01,02,0"
-
-AMP_REPLY_PWR_ON = "#02,01,1"
-AMP_REPLY_PWR_STANDBY = "#02,01,0"
-AMP_REPLY_MUTE_ON = "#02,03,1"
-AMP_REPLY_MUTE_OFF = "#02,03,0"
-
-def setup_platform(hass, config, add_devices, discovery_info=None):
-    device = config.get(CONF_DEVICE)
-    name = config.get(CONF_NAME)
-    cxatype = config.get(CONF_TYPE)
-    cxnhost = config.get(CONF_SLAVE)
-
-    if device is None:
-        _LOGGER.error("No serial port defined in configuration.yaml for Cambridge CXA")
-        return
-
-    if cxatype is None:
-        _LOGGER.error("No CXA type found in configuration.yaml file. Possible values are CXA61, CXA81")
-        return
-
-    add_devices([CambridgeCXADevice(hass, device, name, cxatype, cxnhost)])
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up the Cambridge CXA media player from a config entry."""
+    coordinator: CambridgeCXACoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities([CambridgeCXADevice(coordinator, entry)])
 
 
-class CambridgeCXADevice(MediaPlayerEntity):
-    def __init__(self, hass, device, name, cxatype, cxnhost):
-        _LOGGER.debug("Setting up Cambridge CXA")
-        self._hass = hass
-        self._device = device
-        self._mediasource = "#04,01,00"
-        self._speakersactive = ""
-        self._muted = AMP_REPLY_MUTE_OFF
-        self._name = name
-        self._pwstate = ""
-        self._cxatype = cxatype.upper()
-        if self._cxatype == "CXA61":
-            self._source_list = NORMAL_INPUTS_CXA61.copy()
-            self._source_reply_list = NORMAL_INPUTS_AMP_REPLY_CXA61.copy()
+class CambridgeCXADevice(
+    CoordinatorEntity[CambridgeCXACoordinator], MediaPlayerEntity
+):
+    """Cambridge Audio CXA amplifier media player entity.
+
+    State is read from coordinator.data (populated every 30 s).
+    Commands are forwarded to coordinator.async_command() which serialises
+    them with the update lock so nothing interleaves mid-poll.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = None  # Use the device name as the entity name
+
+    def __init__(
+        self, coordinator: CambridgeCXACoordinator, entry: ConfigEntry
+    ) -> None:
+        """Initialize the media player entity."""
+        super().__init__(coordinator)
+        self._entry = entry
+        # Sound mode is write-only (no GET command exists) — tracked locally
+        self._sound_mode: str | None = None
+
+        if coordinator.cxa_type == "CXA61":
+            self._source_list = NORMAL_INPUTS_CXA61
+            self._source_reply_list = NORMAL_INPUTS_AMP_REPLY_CXA61
         else:
-            self._source_list = NORMAL_INPUTS_CXA81.copy()
-            self._source_reply_list = NORMAL_INPUTS_AMP_REPLY_CXA81.copy()
-        self._sound_mode_list = SOUND_MODES.copy()
-        self._state = STATE_OFF
-        self._cxnhost = cxnhost
-        self._serial = Serial(device, baudrate=9600, timeout=2, bytesize=8, parity="N", stopbits=1)
-        
-    def update(self):
-        self._pwstate = self._command_with_reply(AMP_CMD_GET_PWSTATE)
-        self._mediasource = self._command_with_reply(AMP_CMD_GET_CURRENT_SOURCE)
-        self._muted = self._command_with_reply(AMP_CMD_GET_MUTE_STATE)
+            self._source_list = NORMAL_INPUTS_CXA81
+            self._source_reply_list = NORMAL_INPUTS_AMP_REPLY_CXA81
 
-    def _command(self, command):
-        try:
-            self._serial.flush()
-            self._serial.write((command+"\r").encode("utf-8"))
-            self._serial.flush()
-        except:
-            _LOGGER.error("Could not send command")
-    
-    def _command_with_reply(self, command):
-        try:
-            self._serial.write((command+"\r").encode("utf-8"))
-            reply = self._serial.readline()
-            return(reply.decode("utf-8")).replace("\r","")
-        except:
-            _LOGGER.error("Could not send command")
-            return ""
-
-    def url_command(self, command):
-        urllib.request.urlopen("http://" + self._cxnhost + "/" + command).read()
+    # ------------------------------------------------------------------
+    # Entity identity / device grouping
+    # ------------------------------------------------------------------
 
     @property
-    def is_volume_muted(self):
-        if AMP_REPLY_MUTE_ON in self._muted:
-            return True
-        else:
-            return False
+    def unique_id(self) -> str:
+        """Return a unique ID tied to the config entry."""
+        return self._entry.entry_id
 
     @property
-    def name(self):
-        return self._name
+    def device_info(self) -> DeviceInfo:
+        """Group all CXA entities under one device in the registry."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            name=self._entry.data.get(CONF_NAME, DEFAULT_NAME),
+            manufacturer="Cambridge Audio",
+            model=self.coordinator.cxa_type,
+            configuration_url=f"http://{self.coordinator.host}",
+        )
+
+    # ------------------------------------------------------------------
+    # Features
+    # ------------------------------------------------------------------
 
     @property
-    def source(self):
-        return self._source_reply_list[self._mediasource]
-
-    @property
-    def sound_mode_list(self):
-        return sorted(list(self._sound_mode_list.keys()))
-
-    @property
-    def source_list(self):
-        return sorted(list(self._source_list.keys()))
-
-    @property
-    def state(self):
-        if AMP_REPLY_PWR_ON in self._pwstate:
-            return STATE_ON
-        else:
-            return STATE_OFF
-
-    @property
-    def supported_features(self):
-        if self._cxnhost:
-            return SUPPORT_CXA_WITH_CXN
+    def supported_features(self) -> MediaPlayerEntityFeature:
         return SUPPORT_CXA
 
-    def mute_volume(self, mute):
-        if mute:
-            self._command(AMP_CMD_SET_MUTE_ON)
-        else:
-            self._command(AMP_CMD_SET_MUTE_OFF)
+    # ------------------------------------------------------------------
+    # State — all derived from coordinator.data
+    # ------------------------------------------------------------------
 
-    def select_sound_mode(self, sound_mode):
-        self._command(self._sound_mode_list[sound_mode])
+    @property
+    def state(self) -> MediaPlayerState:
+        """Return on or off based on the power reply."""
+        if self.coordinator.data is None:
+            return MediaPlayerState.OFF
+        if AMP_REPLY_PWR_ON in self.coordinator.data.get("power", ""):
+            return MediaPlayerState.ON
+        return MediaPlayerState.OFF
 
-    def select_source(self, source):
-        self._command(self._source_list[source])
+    @property
+    def is_volume_muted(self) -> bool | None:
+        if self.coordinator.data is None:
+            return None
+        return AMP_REPLY_MUTE_ON in self.coordinator.data.get("mute", "")
 
-    def turn_on(self):
-        self._command(AMP_CMD_SET_PWR_ON)
+    @property
+    def volume_level(self) -> float | None:
+        """Return volume as 0.0–1.0 (mapped from 0–96)."""
+        if self.coordinator.data is None:
+            return None
+        reply = self.coordinator.data.get("volume", "")
+        if reply.startswith(AMP_REPLY_VOLUME_PREFIX):
+            try:
+                raw = int(reply[len(AMP_REPLY_VOLUME_PREFIX):])
+                return raw / MAX_VOLUME
+            except ValueError:
+                pass
+        return None
 
-    def turn_off(self):
-        self._command(AMP_CMD_SET_PWR_OFF)
+    @property
+    def source(self) -> str | None:
+        """Return the current input source name, or None if unknown."""
+        if self.coordinator.data is None:
+            return None
+        media_source = self.coordinator.data.get("source", "")
+        return self._source_reply_list.get(media_source)
 
-    def volume_up(self):
-        self.url_command("smoip/zone/state?pre_amp_mode=false")
-        self
+    @property
+    def source_list(self) -> list[str]:
+        return sorted(self._source_list.keys())
+
+    @property
+    def sound_mode(self) -> str | None:
+        """Return the locally-tracked speaker output mode."""
+        return self._sound_mode
+
+    @property
+    def sound_mode_list(self) -> list[str]:
+        return sorted(SOUND_MODES.keys())
+
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
+
+    async def async_turn_on(self) -> None:
+        await self.coordinator.async_command(AMP_CMD_SET_PWR_ON)
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_off(self) -> None:
+        await self.coordinator.async_command(AMP_CMD_SET_PWR_OFF)
+        await self.coordinator.async_request_refresh()
+
+    async def async_mute_volume(self, mute: bool) -> None:
+        cmd = AMP_CMD_SET_MUTE_ON if mute else AMP_CMD_SET_MUTE_OFF
+        await self.coordinator.async_command(cmd)
+        await self.coordinator.async_request_refresh()
+
+    async def async_volume_up(self) -> None:
+        """Send a volume-up step via RS232 (#01,16)."""
+        await self.coordinator.async_command(AMP_CMD_VOL_UP)
+        await self.coordinator.async_request_refresh()
+
+    async def async_volume_down(self) -> None:
+        """Send a volume-down step via RS232 (#01,17)."""
+        await self.coordinator.async_command(AMP_CMD_VOL_DOWN)
+        await self.coordinator.async_request_refresh()
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        """Set absolute volume level (0.0–1.0 → 0–96 via #01,14,n)."""
+        level = round(volume * MAX_VOLUME)
+        await self.coordinator.async_command(f"#01,14,{level}")
+        await self.coordinator.async_request_refresh()
+
+    async def async_select_source(self, source: str) -> None:
+        cmd = self._source_list.get(source)
+        if cmd:
+            await self.coordinator.async_command(cmd)
+            await self.coordinator.async_request_refresh()
+
+    async def async_select_sound_mode(self, sound_mode: str) -> None:
+        """Switch speaker output (A / A+B / B). State tracked locally."""
+        cmd = SOUND_MODES.get(sound_mode)
+        if cmd:
+            await self.coordinator.async_command(cmd)
+            self._sound_mode = sound_mode
+            self.async_write_ha_state()
