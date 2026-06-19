@@ -178,12 +178,14 @@ class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
         try:
             self._writer.write((command + "\r").encode("utf-8"))  # type: ignore[union-attr]
             await self._writer.drain()  # type: ignore[union-attr]
+            # The CXA protocol uses \r (CR) as line terminator, not \n.
+            # readline() would wait for \n and time out every time.
             reply = await asyncio.wait_for(
-                self._reader.readline(),  # type: ignore[union-attr]
+                self._reader.readuntil(b"\r"),  # type: ignore[union-attr]
                 timeout=2.0,
             )
             return reply.decode("utf-8").strip()
-        except (OSError, asyncio.TimeoutError, UnicodeDecodeError) as err:
+        except (OSError, asyncio.TimeoutError, UnicodeDecodeError, asyncio.LimitOverrunError) as err:
             _LOGGER.warning("Command '%s' failed: %s", command, err)
             await self._close_connection()
             return ""
