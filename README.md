@@ -191,3 +191,5 @@ volumes:
   - /dev/ttyCXA:/dev/ttyCXA
 ```
 
+## Changelog
+* **Performance Optimization:** Volume up and volume down commands (via the Raspberry Pi HTTP API) now utilize Home Assistant's centralized HTTP session pool (`async_get_clientsession`). This eliminates DNS and TCP handshake overhead on every button press, making volume adjustments near-instantaneous.
