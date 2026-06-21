@@ -8,6 +8,7 @@ async; state is driven by the shared CambridgeCXACoordinator.
 from __future__ import annotations
 
 import logging
+import aiohttp
 
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
@@ -46,6 +47,7 @@ SUPPORT_CXA = (
     | MediaPlayerEntityFeature.TURN_OFF
     | MediaPlayerEntityFeature.TURN_ON
     | MediaPlayerEntityFeature.VOLUME_MUTE
+    | MediaPlayerEntityFeature.VOLUME_STEP
 )
 
 
@@ -175,7 +177,27 @@ class CambridgeCXADevice(
         await self.coordinator.async_command(cmd)
         await self.coordinator.async_request_refresh()
 
+    async def async_volume_up(self) -> None:
+        """Send volume up command via the Raspberry Pi HTTP API."""
+        try:
+            url = f"http://{self.coordinator.host}:5001/vol/up"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=2) as response:
+                    if response.status != 200:
+                        _LOGGER.error("Failed to turn volume up, Pi returned %s", response.status)
+        except Exception as e:
+            _LOGGER.error("Error communicating with Pi IR API: %s", e)
 
+    async def async_volume_down(self) -> None:
+        """Send volume down command via the Raspberry Pi HTTP API."""
+        try:
+            url = f"http://{self.coordinator.host}:5001/vol/down"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=2) as response:
+                    if response.status != 200:
+                        _LOGGER.error("Failed to turn volume down, Pi returned %s", response.status)
+        except Exception as e:
+            _LOGGER.error("Error communicating with Pi IR API: %s", e)
 
     async def async_select_source(self, source: str) -> None:
         cmd = self._source_list.get(source)
