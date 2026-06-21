@@ -21,6 +21,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     AMP_CMD_SET_MUTE_OFF,
@@ -181,8 +182,8 @@ class CambridgeCXADevice(
         """Send volume up command via the Raspberry Pi HTTP API."""
         try:
             url = f"http://{self.coordinator.host}:5001/vol/up"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=2) as response:
+            session = async_get_clientsession(self.coordinator.hass)
+            async with session.get(url, timeout=2) as response:
                     if response.status != 200:
                         _LOGGER.error("Failed to turn volume up, Pi returned %s", response.status)
         except Exception as e:
@@ -192,8 +193,8 @@ class CambridgeCXADevice(
         """Send volume down command via the Raspberry Pi HTTP API."""
         try:
             url = f"http://{self.coordinator.host}:5001/vol/down"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=2) as response:
+            session = async_get_clientsession(self.coordinator.hass)
+            async with session.get(url, timeout=2) as response:
                     if response.status != 200:
                         _LOGGER.error("Failed to turn volume down, Pi returned %s", response.status)
         except Exception as e:
