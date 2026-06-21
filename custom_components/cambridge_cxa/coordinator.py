@@ -1,9 +1,8 @@
-"""Cambridge Audio CXA coordinator — async TCP connection and data polling."""
+"""Cambridge Audio CXA coordinator — async TCP connection and push updates."""
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -13,29 +12,30 @@ from .const import (
     AMP_CMD_GET_MUTE_STATE,
     AMP_CMD_GET_PWSTATE,
     AMP_REPLY_PWR_ON,
+    AMP_REPLY_PWR_STANDBY,
+    AMP_REPLY_MUTE_ON,
+    AMP_REPLY_MUTE_OFF,
     DOMAIN,
 )
 
 _LOGGER = logging.getLogger(__name__)
-SCAN_INTERVAL = timedelta(seconds=30)
-
 
 class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
-    """Manages the TCP connection and periodic polling for the CXA amplifier.
+    """Manages the TCP connection and push updates for the CXA amplifier.
 
-    All I/O is protected by a single asyncio.Lock so that entity action
-    commands (e.g. turn_on) never interleave with the update polling cycle.
+    Uses a listen-only loop to monitor for state changes broadcasted by the
+    amplifier without keeping it awake via active polling.
     """
 
     def __init__(
         self, hass: HomeAssistant, host: str, port: int, cxa_type: str
     ) -> None:
         """Initialize the coordinator."""
+        # Note: update_interval is purposely omitted to disable periodic polling.
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=SCAN_INTERVAL,
         )
         self._host = host
         self._port = port
@@ -43,6 +43,8 @@ class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._command_lock = asyncio.Lock()
+        self._listen_task: asyncio.Task | None = None
+        self.data = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -66,16 +68,16 @@ class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
 
     async def async_disconnect(self) -> None:
         """Close the TCP connection cleanly."""
+        if self._listen_task:
+            self._listen_task.cancel()
+            self._listen_task = None
         async with self._command_lock:
             await self._close_connection()
 
     async def async_command(self, command: str) -> None:
-        """Send a command with no reply expected (e.g. power on, volume step).
+        """Send a command with no reply expected (fire-and-forget).
 
-        After sending, we attempt to drain any reply the amp may have sent
-        (e.g. a volume echo) with a short timeout.  Without this, stale reply
-        bytes sit in the TCP buffer and corrupt the next readuntil() call in
-        the polling cycle, making the integration think the amp switched off.
+        The amplifier will broadcast its new state, which is caught by _listen_loop.
         """
         async with self._command_lock:
             await self._ensure_connected()
@@ -86,53 +88,98 @@ class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
                 _LOGGER.debug("TX: %s", command)
                 self._writer.write((command + "\r").encode("utf-8"))  # type: ignore[union-attr]
                 await self._writer.drain()  # type: ignore[union-attr]
-                # Consume any unsolicited reply within 300 ms.
-                try:
-                    reply = await asyncio.wait_for(
-                        self._reader.readuntil(b"\r"),  # type: ignore[union-attr]
-                        timeout=0.3,
-                    )
-                    _LOGGER.debug("RX (unsolicited after %s): %s", command, reply.decode("utf-8").strip())
-                except (asyncio.TimeoutError, asyncio.LimitOverrunError):
-                    pass  # No reply — expected for many commands
             except OSError as err:
                 _LOGGER.warning("Send failed for '%s': %s", command, err)
                 await self._close_connection()
-
-    async def async_command_with_reply(self, command: str) -> str:
-        """Send a command and return the reply line."""
-        async with self._command_lock:
-            return await self._send_with_reply(command)
 
     # ------------------------------------------------------------------
     # DataUpdateCoordinator hook
     # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict:
-        """Fetch all amplifier state under one lock acquisition.
+        """Perform initial state sync on startup.
 
-        Holding the lock for the entire sequence prevents entity action
-        commands from slipping between individual command/reply pairs and
-        corrupting the readline() buffer.
+        Because update_interval is not set, this is only called once by
+        async_config_entry_first_refresh(). We establish the connection,
+        seed the state via query commands, and then start the listen loop.
         """
         async with self._command_lock:
-            power = await self._send_with_reply(AMP_CMD_GET_PWSTATE)
+            await self._ensure_connected()
+            if not self._is_connected():
+                raise UpdateFailed(f"No response from Cambridge CXA at {self._host}:{self._port}")
 
-            if not power:
-                raise UpdateFailed(
-                    f"No response from Cambridge CXA at {self._host}:{self._port}"
-                )
+            if self._listen_task is None or self._listen_task.done():
+                self._listen_task = self.hass.loop.create_task(self._listen_loop())
 
-            data: dict = {"power": power}
+            _LOGGER.info("Sending initial state-sync queries")
+            # Send queries without reading the reply. The listen loop will catch the replies.
+            try:
+                self._writer.write((AMP_CMD_GET_PWSTATE + "\r").encode("utf-8"))  # type: ignore[union-attr]
+                self._writer.write((AMP_CMD_GET_CURRENT_SOURCE + "\r").encode("utf-8"))  # type: ignore[union-attr]
+                self._writer.write((AMP_CMD_GET_MUTE_STATE + "\r").encode("utf-8"))  # type: ignore[union-attr]
+                await self._writer.drain()  # type: ignore[union-attr]
+            except OSError as err:
+                raise UpdateFailed(f"Failed to send initial sync: {err}")
 
-            if AMP_REPLY_PWR_ON in power:
-                data["source"] = await self._send_with_reply(AMP_CMD_GET_CURRENT_SOURCE)
-                data["mute"] = await self._send_with_reply(AMP_CMD_GET_MUTE_STATE)
-
-            return data
+            # Return whatever we have (starts empty, listen loop fills it milliseconds later)
+            return self.data
 
     # ------------------------------------------------------------------
-    # Internal helpers  (must be called with _command_lock already held)
+    # Listen Loop (Push Architecture)
+    # ------------------------------------------------------------------
+
+    async def _listen_loop(self) -> None:
+        """Background task to read from the socket and update state."""
+        _LOGGER.debug("Starting CXA listen loop")
+        while True:
+            # Check connection
+            async with self._command_lock:
+                await self._ensure_connected()
+                reader = self._reader
+            
+            if not reader:
+                await asyncio.sleep(5)
+                continue
+
+            try:
+                # Read without holding the lock so we don't block outgoing commands
+                reply = await reader.readuntil(b"\r")
+                decoded = reply.decode("utf-8").strip()
+                if decoded:
+                    _LOGGER.debug("RX (listen_loop): %s", decoded)
+                    self._handle_message(decoded)
+            except (asyncio.IncompleteReadError, ConnectionError, OSError) as err:
+                _LOGGER.warning("CXA connection lost during listen loop: %s", err)
+                async with self._command_lock:
+                    await self._close_connection()
+                await asyncio.sleep(5)
+
+    def _handle_message(self, message: str) -> None:
+        """Parse incoming broadcast message and push update."""
+        updated = False
+
+        if message.startswith(AMP_REPLY_PWR_ON):
+            self.data["power"] = message
+            updated = True
+        elif message.startswith(AMP_REPLY_PWR_STANDBY):
+            self.data["power"] = message
+            updated = True
+        elif message.startswith("#04,01,"):
+            # Source change
+            self.data["source"] = message
+            updated = True
+        elif message.startswith(AMP_REPLY_MUTE_ON):
+            self.data["mute"] = message
+            updated = True
+        elif message.startswith(AMP_REPLY_MUTE_OFF):
+            self.data["mute"] = message
+            updated = True
+
+        if updated:
+            self.async_set_updated_data(self.data)
+
+    # ------------------------------------------------------------------
+    # Internal helpers (must be called with _command_lock already held)
     # ------------------------------------------------------------------
 
     def _is_connected(self) -> bool:
@@ -173,30 +220,3 @@ class CambridgeCXACoordinator(DataUpdateCoordinator[dict]):
         if not self._is_connected():
             _LOGGER.debug("Reconnecting to %s:%s", self._host, self._port)
             await self._connect()
-
-    async def _send_with_reply(self, command: str) -> str:
-        """Send command and read one reply line (lock must be held).
-
-        Reconnects automatically if the connection was lost.
-        Returns an empty string on any failure.
-        """
-        await self._ensure_connected()
-        if not self._is_connected():
-            return ""
-        try:
-            _LOGGER.debug("TX: %s", command)
-            self._writer.write((command + "\r").encode("utf-8"))  # type: ignore[union-attr]
-            await self._writer.drain()  # type: ignore[union-attr]
-            # The CXA protocol uses \r (CR) as line terminator, not \n.
-            # readline() would wait for \n and time out every time.
-            reply = await asyncio.wait_for(
-                self._reader.readuntil(b"\r"),  # type: ignore[union-attr]
-                timeout=2.0,
-            )
-            decoded = reply.decode("utf-8").strip()
-            _LOGGER.debug("RX: %s", decoded)
-            return decoded
-        except (OSError, asyncio.TimeoutError, UnicodeDecodeError, asyncio.LimitOverrunError) as err:
-            _LOGGER.warning("Command '%s' failed: %s", command, err)
-            await self._close_connection()
-            return ""

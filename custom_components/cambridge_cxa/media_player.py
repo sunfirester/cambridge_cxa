@@ -167,16 +167,13 @@ class CambridgeCXADevice(
 
     async def async_turn_on(self) -> None:
         await self.coordinator.async_command(AMP_CMD_SET_PWR_ON)
-        await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self) -> None:
         await self.coordinator.async_command(AMP_CMD_SET_PWR_OFF)
-        await self.coordinator.async_request_refresh()
 
     async def async_mute_volume(self, mute: bool) -> None:
         cmd = AMP_CMD_SET_MUTE_ON if mute else AMP_CMD_SET_MUTE_OFF
         await self.coordinator.async_command(cmd)
-        await self.coordinator.async_request_refresh()
 
     async def async_volume_up(self) -> None:
         """Send volume up command via the Raspberry Pi HTTP API."""
@@ -204,7 +201,6 @@ class CambridgeCXADevice(
         cmd = self._source_list.get(source)
         if cmd:
             await self.coordinator.async_command(cmd)
-            await self.coordinator.async_request_refresh()
 
     async def async_select_sound_mode(self, sound_mode: str) -> None:
         """Switch speaker output (A / A+B / B). State tracked locally."""
